@@ -13,6 +13,12 @@
 #include "esp_http_server.h"
 #include "esp_camera.h"
 #include "driver/i2s_pdm.h"
+#include "driver/gpio.h"
+#include "img_converters.h"
+#include "esp_sntp.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "llm.h"
@@ -31,6 +37,22 @@ static bool cam_ok = false;
 #define MIC_GAIN 4     // amplificazione software (prova 2..8)
 static i2s_chan_handle_t mic_rx = NULL;
 static bool mic_ok = false;
+
+// ---- Rilevamento movimento ----
+#define MOT_W 80          // il fotogramma VGA (640x480) ridotto di 8 volte
+#define MOT_H 60
+#define MOT_PIX_THR 25    // di quanto deve cambiare la luminosita' di un punto (0-255)
+#define MOT_PAUSA_MS 2000 // dopo un evento, pausa prima di contarne un altro
+#define LED_PIN GPIO_NUM_21 // LED arancione della XIAO (si accende con livello basso)
+static bool mot_attivo = true;
+static float mot_soglia = 3.0f;   // % dell'immagine che deve cambiare per dire "movimento"
+static float mot_percento = 0.0f; // variazione misurata nell'ultimo confronto
+static int mot_eventi = 0;
+static int64_t mot_ultimo_us = 0;
+static char mot_ultimo_ora[32] = "-";
+static uint8_t *mot_jpg = NULL; // foto dell'ultimo movimento
+static size_t mot_jpg_len = 0, mot_jpg_cap = 0;
+static SemaphoreHandle_t mot_lock = NULL;
 
 // gancio definito in llm.c: riceve ogni pezzo di testo generato
 extern void (*llm_token_cb)(const char *piece);
@@ -74,6 +96,14 @@ static const char *PAGINA =
     "<img id='cam' style='width:100%;border-radius:8px;background:#000;min-height:40px' alt=''>"
     "<button id='bmic'>Ascolta il microfono</button>"
     "<audio id='au' controls style='width:100%'></audio>"
+    "<h2>Rilevamento movimento</h2>"
+    "<div id='mstat' style='color:#fff;padding:10px;border-radius:8px;text-align:center;background:#999;font-weight:bold'>...</div>"
+    "<small id='minfo'></small>"
+    "<label style='display:block;margin:8px 0'><input type='checkbox' id='mon' style='width:auto'> Rilevamento attivo</label>"
+    "<label>Sensibilita': scatta se cambia il <span id='msv'>3</span>% dell'immagine</label>"
+    "<input type='range' id='msog' min='0.5' max='20' step='0.5' value='3'>"
+    "<p>Ultimo movimento: <span id='mora'>-</span></p>"
+    "<img id='mimg' style='width:100%;border-radius:8px;background:#eee;min-height:40px' alt=''>"
     "<small>Il video arriva dalla porta 81, l'audio dalla porta 82 (con qualche secondo di ritardo).</small><br>"
     "<small>Generato dalla XIAO ESP32-S3, senza internet.</small>"
     "<script>"
@@ -94,6 +124,18 @@ static const char *PAGINA =
     " else{c.src='http://'+h+':81/stream';$('bcam').textContent='Ferma video';}};"
     "$('bmic').onclick=()=>{const a=$('au');if(a.src&&!a.paused){a.pause();a.removeAttribute('src');a.load();$('bmic').textContent='Ascolta il microfono';}"
     " else{a.src='http://'+h+':82/audio?t='+Date.now();a.play();$('bmic').textContent='Ferma audio';}};"
+    "let ev=-1,prima=true;"
+    "async function mot(){try{const r=await fetch('http://'+h+':83/moto');const j=await r.json();"
+    " const s=$('mstat');s.textContent=!j.attivo?'Rilevamento spento':(j.movimento?'MOVIMENTO!':'Tutto tranquillo');"
+    " s.style.background=!j.attivo?'#999':(j.movimento?'#c0392b':'#27ae60');"
+    " $('minfo').textContent='Eventi: '+j.eventi+'  -  variazione ora: '+j.percento.toFixed(1)+'%';"
+    " $('mora').textContent=j.ultimo;"
+    " if(j.eventi!=ev){ev=j.eventi;if(ev>0)$('mimg').src='http://'+h+':83/ultimo.jpg?n='+ev;}"
+    " if(prima){prima=false;$('mon').checked=j.attivo;$('msog').value=j.soglia;$('msv').textContent=j.soglia;}"
+    "}catch(e){$('mstat').textContent='Rilevamento non raggiungibile';$('mstat').style.background='#999';}}"
+    "setInterval(mot,1000);mot();"
+    "$('msog').oninput=()=>$('msv').textContent=$('msog').value;"
+    "$('msog').onchange=$('mon').onchange=()=>fetch('http://'+h+':83/imposta?soglia='+$('msog').value+'&on='+($('mon').checked?1:0));"
     "</script></body></html>";
 
 // ------------------------------------------------------------
@@ -210,7 +252,7 @@ static void start_server(void)
     config.core_id = 0;
     config.send_wait_timeout = 30;
     config.recv_wait_timeout = 30;
-    config.max_open_sockets = 5;
+    config.max_open_sockets = 2; // le connessioni di rete sono 16 in tutto, divise fra 4 server
     config.lru_purge_enable = true;
 
     httpd_handle_t server = NULL;
@@ -388,6 +430,167 @@ static esp_err_t audio_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// ------------------------------------------------------------
+// Rilevamento movimento
+// ------------------------------------------------------------
+static void ora_attuale(char *out, size_t n)
+{
+    time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    if (tm.tm_year < 120) // orologio non ancora sincronizzato via internet
+        snprintf(out, n, "%llds dall'avvio", (long long)(esp_timer_get_time() / 1000000));
+    else
+        strftime(out, n, "%d/%m %H:%M:%S", &tm);
+}
+
+static void motion_task(void *arg)
+{
+    uint8_t *rgb = heap_caps_malloc(MOT_W * MOT_H * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *prev = malloc(MOT_W * MOT_H);
+    uint8_t *cur = malloc(MOT_W * MOT_H);
+    if (!rgb || !prev || !cur)
+    {
+        ESP_LOGE(TAG, "Memoria insufficiente per il rilevamento movimento");
+        vTaskDelete(NULL);
+    }
+    bool have_prev = false;
+    ESP_LOGI(TAG, "Rilevamento movimento avviato");
+
+    while (true)
+    {
+        vTaskDelay(pdMS_TO_TICKS(250)); // circa 4 controlli al secondo
+        int64_t now = esp_timer_get_time();
+        gpio_set_level(LED_PIN, (now - mot_ultimo_us < 1000000 && mot_eventi > 0) ? 0 : 1);
+
+        if (!mot_attivo)
+        {
+            have_prev = false;
+            continue;
+        }
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb)
+            continue;
+        // decodifica il JPEG gia' rimpicciolito di 8 volte: 80x60 punti, molto veloce
+        if (fb->format != PIXFORMAT_JPEG || fb->width != MOT_W * 8 ||
+            !jpg2rgb565(fb->buf, fb->len, rgb, JPG_SCALE_8X))
+        {
+            esp_camera_fb_return(fb);
+            continue;
+        }
+        // da colore (RGB565) a scala di grigi
+        for (int i = 0; i < MOT_W * MOT_H; i++)
+        {
+            uint8_t b0 = rgb[2 * i], b1 = rgb[2 * i + 1];
+            int r = b0 & 0xF8;
+            int g = ((b0 & 0x07) << 5) | ((b1 & 0xE0) >> 3);
+            int b = (b1 & 0x1F) << 3;
+            cur[i] = (uint8_t)((r * 77 + g * 150 + b * 29) >> 8);
+        }
+        if (have_prev)
+        {
+            int changed = 0;
+            for (int i = 0; i < MOT_W * MOT_H; i++)
+                if (abs((int)cur[i] - (int)prev[i]) > MOT_PIX_THR)
+                    changed++;
+            mot_percento = 100.0f * changed / (MOT_W * MOT_H);
+
+            if (mot_percento >= mot_soglia && now - mot_ultimo_us > MOT_PAUSA_MS * 1000LL)
+            {
+                xSemaphoreTake(mot_lock, portMAX_DELAY);
+                if (fb->len > mot_jpg_cap)
+                {
+                    free(mot_jpg);
+                    mot_jpg = heap_caps_malloc(fb->len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                    mot_jpg_cap = mot_jpg ? fb->len : 0;
+                }
+                if (mot_jpg)
+                {
+                    memcpy(mot_jpg, fb->buf, fb->len);
+                    mot_jpg_len = fb->len;
+                }
+                mot_eventi++;
+                mot_ultimo_us = now;
+                ora_attuale(mot_ultimo_ora, sizeof(mot_ultimo_ora));
+                xSemaphoreGive(mot_lock);
+                ESP_LOGW(TAG, "MOVIMENTO! %.1f%% dell'immagine cambiata (evento %d, %s)",
+                         mot_percento, mot_eventi, mot_ultimo_ora);
+            }
+        }
+        uint8_t *t = prev; // il fotogramma attuale diventa il riferimento
+        prev = cur;
+        cur = t;
+        have_prev = true;
+        esp_camera_fb_return(fb);
+    }
+}
+
+static esp_err_t send_moto_json(httpd_req_t *req)
+{
+    char json[200];
+    bool movimento = mot_eventi > 0 && (esp_timer_get_time() - mot_ultimo_us) < 3000000;
+    xSemaphoreTake(mot_lock, portMAX_DELAY);
+    int n = snprintf(json, sizeof(json),
+                     "{\"attivo\":%s,\"movimento\":%s,\"eventi\":%d,\"percento\":%.2f,\"soglia\":%.1f,\"ultimo\":\"%s\"}",
+                     mot_attivo ? "true" : "false", movimento ? "true" : "false",
+                     mot_eventi, mot_percento, mot_soglia, mot_ultimo_ora);
+    xSemaphoreGive(mot_lock);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    return httpd_resp_send(req, json, n);
+}
+
+static esp_err_t moto_handler(httpd_req_t *req)
+{
+    return send_moto_json(req);
+}
+
+static esp_err_t imposta_handler(httpd_req_t *req)
+{
+    char query[96], value[16];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK)
+    {
+        if (httpd_query_key_value(query, "soglia", value, sizeof(value)) == ESP_OK)
+        {
+            float s = strtof(value, NULL);
+            if (s >= 0.1f && s <= 100.0f)
+                mot_soglia = s;
+        }
+        if (httpd_query_key_value(query, "on", value, sizeof(value)) == ESP_OK)
+            mot_attivo = (value[0] == '1');
+    }
+    ESP_LOGI(TAG, "Rilevamento %s, soglia %.1f%%", mot_attivo ? "attivo" : "spento", mot_soglia);
+    return send_moto_json(req);
+}
+
+static esp_err_t ultimo_handler(httpd_req_t *req)
+{
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    xSemaphoreTake(mot_lock, portMAX_DELAY);
+    esp_err_t r;
+    if (mot_jpg_len == 0)
+        r = httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Nessun movimento ancora");
+    else
+    {
+        httpd_resp_set_type(req, "image/jpeg");
+        r = httpd_resp_send(req, (const char *)mot_jpg, mot_jpg_len);
+    }
+    xSemaphoreGive(mot_lock);
+    return r;
+}
+
+static void motion_init(void)
+{
+    gpio_reset_pin(LED_PIN);
+    gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_PIN, 1); // spento
+    mot_lock = xSemaphoreCreateMutex();
+    if (cam_ok)
+        xTaskCreatePinnedToCore(motion_task, "moto", 6144, NULL, 5, NULL, 0);
+}
+
 static void start_media_servers(void)
 {
     // ogni flusso ha il suo server, cosi' video, audio e storie non si bloccano a vicenda
@@ -422,6 +625,26 @@ static void start_media_servers(void)
     }
     else
         ESP_LOGE(TAG, "Server audio non avviato");
+
+    httpd_config_t mc = HTTPD_DEFAULT_CONFIG();
+    mc.server_port = 83;
+    mc.ctrl_port = 32771;
+    mc.max_open_sockets = 2;
+    mc.lru_purge_enable = true;
+    mc.stack_size = 4096;
+    mc.core_id = 0;
+    httpd_handle_t ms = NULL;
+    if (httpd_start(&ms, &mc) == ESP_OK)
+    {
+        httpd_uri_t u1 = {.uri = "/moto", .method = HTTP_GET, .handler = moto_handler};
+        httpd_uri_t u2 = {.uri = "/imposta", .method = HTTP_GET, .handler = imposta_handler};
+        httpd_uri_t u3 = {.uri = "/ultimo.jpg", .method = HTTP_GET, .handler = ultimo_handler};
+        httpd_register_uri_handler(ms, &u1);
+        httpd_register_uri_handler(ms, &u2);
+        httpd_register_uri_handler(ms, &u3);
+    }
+    else
+        ESP_LOGE(TAG, "Server movimento non avviato");
 }
 
 // ------------------------------------------------------------
@@ -489,6 +712,7 @@ void app_main(void)
     // 0. fotocamera e microfono (prima del modello: la fotocamera vuole memoria DMA libera)
     camera_init();
     mic_init();
+    motion_init();
 
     // 1. carica il modello
     init_storage();
@@ -504,5 +728,12 @@ void app_main(void)
     wifi_init();
     start_server();
     start_media_servers();
+
+    // 3. orologio da internet, per l'ora degli eventi (fuso orario italiano)
+    setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+    tzset();
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
     ESP_LOGI(TAG, "Pronto! Apri l'indirizzo mostrato sopra.");
 }
