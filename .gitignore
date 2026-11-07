@@ -1,0 +1,8 @@
+build/
+.vscode
+managed_components/
+sdkconfig.old
+.DS_Store
+main/wifi_config.h
+ESP32_LLM.jpg
+llm_output.gif

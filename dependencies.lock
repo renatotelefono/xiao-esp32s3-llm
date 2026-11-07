@@ -1,0 +1,39 @@
+dependencies:
+  espressif/esp-dsp:
+    component_hash: fa7fe74305df6da25867437ebcd4213e047cbfc0556cf92067ab657fce537c6e
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.2'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.5.2
+  idf:
+    source:
+      type: idf
+    version: 5.4.4
+  u8g2:
+    component_hash: 0d0e38f1c257baca5c4f1ea1106958e7da90eda35ca28295458eb0b2539590dd
+    dependencies: []
+    source:
+      git: https://github.com/olikraus/u8g2.git
+      path: .
+      type: git
+    version: d6c8499c5f2707cac8eccd09fd8f677d12b17977
+  u8g2-hal-esp-idf:
+    component_hash: e4ef692fe1474d30d9926917a6e7a655d7942ab5386121c270687dc3e8257c7f
+    dependencies: []
+    source:
+      git: https://github.com/mkfrey/u8g2-hal-esp-idf.git
+      path: .
+      type: git
+    version: 2367ad08909c7cceaa7a00ebd4ea6fd597a3da35
+direct_dependencies:
+- espressif/esp-dsp
+- idf
+- u8g2
+- u8g2-hal-esp-idf
+manifest_hash: 077b4d3bdd4ac145570429b33e796a1fe059943d5b8d54867556279fa9ff3944
+target: esp32s3
+version: 2.0.0
