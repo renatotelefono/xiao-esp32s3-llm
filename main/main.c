@@ -11,6 +11,8 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
+#include "esp_camera.h"
+#include "driver/i2s_pdm.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "llm.h"
@@ -19,6 +21,16 @@
 #include "wifi_config.h" // credenziali Wi-Fi (file non pubblicato, vedi wifi_config.example.h)
 
 static const char *TAG = "MAIN";
+
+// ---- Fotocamera (pin della XIAO ESP32-S3 Sense) ----
+static bool cam_ok = false;
+#define PART_BOUNDARY "123456789000000000000987654321"
+
+// ---- Microfono PDM (CLK = GPIO42, DATA = GPIO41) ----
+#define MIC_RATE 16000 // campioni al secondo
+#define MIC_GAIN 4     // amplificazione software (prova 2..8)
+static i2s_chan_handle_t mic_rx = NULL;
+static bool mic_ok = false;
 
 // gancio definito in llm.c: riceve ogni pezzo di testo generato
 extern void (*llm_token_cb)(const char *piece);
@@ -57,6 +69,12 @@ static const char *PAGINA =
     "<select id='passi'><option value='128'>Corta</option><option value='256' selected>Media</option><option value='512'>Lunga</option></select>"
     "<button id='go'>Nuova storia</button>"
     "<div id='out'></div>"
+    "<h2>Cosa vede e sente la scheda</h2>"
+    "<button id='bcam'>Avvia video</button>"
+    "<img id='cam' style='width:100%;border-radius:8px;background:#000;min-height:40px' alt=''>"
+    "<button id='bmic'>Ascolta il microfono</button>"
+    "<audio id='au' controls style='width:100%'></audio>"
+    "<small>Il video arriva dalla porta 81, l'audio dalla porta 82 (con qualche secondo di ritardo).</small><br>"
     "<small>Generato dalla XIAO ESP32-S3, senza internet.</small>"
     "<script>"
     "const $=id=>document.getElementById(id);"
@@ -71,6 +89,11 @@ static const char *PAGINA =
     " }catch(e){$('out').textContent+='\\n[Errore: '+e+']';}"
     " $('go').disabled=false;"
     "};"
+    "const h=location.hostname;"
+    "$('bcam').onclick=()=>{const c=$('cam');if(c.src){c.removeAttribute('src');$('bcam').textContent='Avvia video';}"
+    " else{c.src='http://'+h+':81/stream';$('bcam').textContent='Ferma video';}};"
+    "$('bmic').onclick=()=>{const a=$('au');if(a.src&&!a.paused){a.pause();a.removeAttribute('src');a.load();$('bmic').textContent='Ascolta il microfono';}"
+    " else{a.src='http://'+h+':82/audio?t='+Date.now();a.play();$('bmic').textContent='Ferma audio';}};"
     "</script></body></html>";
 
 // ------------------------------------------------------------
@@ -187,6 +210,8 @@ static void start_server(void)
     config.core_id = 0;
     config.send_wait_timeout = 30;
     config.recv_wait_timeout = 30;
+    config.max_open_sockets = 5;
+    config.lru_purge_enable = true;
 
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) == ESP_OK)
@@ -201,6 +226,202 @@ static void start_server(void)
     {
         ESP_LOGE(TAG, "Impossibile avviare il server web");
     }
+}
+
+// ------------------------------------------------------------
+// Fotocamera
+// ------------------------------------------------------------
+static void camera_init(void)
+{
+    camera_config_t c = {
+        .pin_pwdn = -1,
+        .pin_reset = -1,
+        .pin_xclk = 10,
+        .pin_sccb_sda = 40,
+        .pin_sccb_scl = 39,
+        .pin_d7 = 48,
+        .pin_d6 = 11,
+        .pin_d5 = 12,
+        .pin_d4 = 14,
+        .pin_d3 = 16,
+        .pin_d2 = 18,
+        .pin_d1 = 17,
+        .pin_d0 = 15,
+        .pin_vsync = 38,
+        .pin_href = 47,
+        .pin_pclk = 13,
+        .xclk_freq_hz = 20000000,
+        .ledc_timer = LEDC_TIMER_0,
+        .ledc_channel = LEDC_CHANNEL_0,
+        .pixel_format = PIXFORMAT_JPEG,
+        .frame_size = FRAMESIZE_VGA, // 640x480
+        .jpeg_quality = 12,          // 10 = migliore, 30 = piu' leggera
+        .fb_count = 2,
+        .fb_location = CAMERA_FB_IN_PSRAM,
+        .grab_mode = CAMERA_GRAB_LATEST,
+    };
+    esp_err_t err = esp_camera_init(&c);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Fotocamera non trovata (%s): controlla che la scheda Sense sia innestata", esp_err_to_name(err));
+        return;
+    }
+    cam_ok = true;
+    ESP_LOGI(TAG, "Fotocamera pronta");
+}
+
+static esp_err_t stream_handler(httpd_req_t *req)
+{
+    if (!cam_ok)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Fotocamera non disponibile");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=" PART_BOUNDARY);
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    char part[96];
+    ESP_LOGI(TAG, "Video avviato");
+    while (true)
+    {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb)
+        {
+            ESP_LOGW(TAG, "Fotogramma perso");
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        int n = snprintf(part, sizeof(part),
+                         "\r\n--" PART_BOUNDARY "\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+                         (unsigned)fb->len);
+        esp_err_t r = httpd_resp_send_chunk(req, part, n);
+        if (r == ESP_OK)
+            r = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+        esp_camera_fb_return(fb);
+        if (r != ESP_OK)
+            break; // il browser ha chiuso
+    }
+    ESP_LOGI(TAG, "Video fermato");
+    return ESP_OK;
+}
+
+// ------------------------------------------------------------
+// Microfono
+// ------------------------------------------------------------
+static void mic_init(void)
+{
+    i2s_chan_config_t cc = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    if (i2s_new_channel(&cc, NULL, &mic_rx) != ESP_OK)
+        return;
+    i2s_pdm_rx_config_t pc = {
+        .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(MIC_RATE),
+        .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .clk = GPIO_NUM_42,
+            .din = GPIO_NUM_41,
+            .invert_flags = {.clk_inv = false},
+        },
+    };
+    if (i2s_channel_init_pdm_rx_mode(mic_rx, &pc) != ESP_OK || i2s_channel_enable(mic_rx) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Microfono non disponibile");
+        return;
+    }
+    mic_ok = true;
+    ESP_LOGI(TAG, "Microfono pronto (%d Hz)", MIC_RATE);
+}
+
+static void wav_header(uint8_t *h, uint32_t rate)
+{
+    uint32_t byte_rate = rate * 2;
+    uint32_t big = 0x7FFFFFFF; // durata "infinita": e' uno streaming
+    memcpy(h, "RIFF", 4);
+    memcpy(h + 4, &big, 4);
+    memcpy(h + 8, "WAVEfmt ", 8);
+    uint32_t fmt_len = 16;
+    uint16_t pcm = 1, ch = 1, align = 2, bits = 16;
+    memcpy(h + 16, &fmt_len, 4);
+    memcpy(h + 20, &pcm, 2);
+    memcpy(h + 22, &ch, 2);
+    memcpy(h + 24, &rate, 4);
+    memcpy(h + 28, &byte_rate, 4);
+    memcpy(h + 32, &align, 2);
+    memcpy(h + 34, &bits, 2);
+    memcpy(h + 36, "data", 4);
+    memcpy(h + 40, &big, 4);
+}
+
+static esp_err_t audio_handler(httpd_req_t *req)
+{
+    if (!mic_ok)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Microfono non disponibile");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "audio/wav");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+
+    uint8_t header[44];
+    wav_header(header, MIC_RATE);
+    if (httpd_resp_send_chunk(req, (const char *)header, sizeof(header)) != ESP_OK)
+        return ESP_OK;
+
+    static int16_t buf[1024];
+    ESP_LOGI(TAG, "Audio avviato");
+    while (true)
+    {
+        size_t bytes = 0;
+        if (i2s_channel_read(mic_rx, buf, sizeof(buf), &bytes, pdMS_TO_TICKS(1000)) != ESP_OK)
+            continue;
+        int n = bytes / 2;
+        for (int i = 0; i < n; i++)
+        {
+            int v = buf[i] * MIC_GAIN;
+            if (v > 32767) v = 32767;
+            if (v < -32768) v = -32768;
+            buf[i] = (int16_t)v;
+        }
+        if (httpd_resp_send_chunk(req, (const char *)buf, bytes) != ESP_OK)
+            break; // il browser ha chiuso
+    }
+    ESP_LOGI(TAG, "Audio fermato");
+    return ESP_OK;
+}
+
+static void start_media_servers(void)
+{
+    // ogni flusso ha il suo server, cosi' video, audio e storie non si bloccano a vicenda
+    httpd_config_t vc = HTTPD_DEFAULT_CONFIG();
+    vc.server_port = 81;
+    vc.ctrl_port = 32769;
+    vc.max_open_sockets = 2;
+    vc.lru_purge_enable = true;
+    vc.stack_size = 6144;
+    vc.core_id = 0;
+    httpd_handle_t vs = NULL;
+    if (httpd_start(&vs, &vc) == ESP_OK)
+    {
+        httpd_uri_t u = {.uri = "/stream", .method = HTTP_GET, .handler = stream_handler};
+        httpd_register_uri_handler(vs, &u);
+    }
+    else
+        ESP_LOGE(TAG, "Server video non avviato");
+
+    httpd_config_t ac = HTTPD_DEFAULT_CONFIG();
+    ac.server_port = 82;
+    ac.ctrl_port = 32770;
+    ac.max_open_sockets = 2;
+    ac.lru_purge_enable = true;
+    ac.stack_size = 6144;
+    ac.core_id = 0;
+    httpd_handle_t as = NULL;
+    if (httpd_start(&as, &ac) == ESP_OK)
+    {
+        httpd_uri_t u = {.uri = "/audio", .method = HTTP_GET, .handler = audio_handler};
+        httpd_register_uri_handler(as, &u);
+    }
+    else
+        ESP_LOGE(TAG, "Server audio non avviato");
 }
 
 // ------------------------------------------------------------
@@ -265,6 +486,10 @@ static void wifi_init(void)
 // ------------------------------------------------------------
 void app_main(void)
 {
+    // 0. fotocamera e microfono (prima del modello: la fotocamera vuole memoria DMA libera)
+    camera_init();
+    mic_init();
+
     // 1. carica il modello
     init_storage();
     build_transformer(&transformer, "/data/stories260K.bin");
@@ -278,5 +503,6 @@ void app_main(void)
     // 2. Wi-Fi e server web
     wifi_init();
     start_server();
+    start_media_servers();
     ESP_LOGI(TAG, "Pronto! Apri l'indirizzo mostrato sopra.");
 }
